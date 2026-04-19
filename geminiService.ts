@@ -1,100 +1,127 @@
-import { GoogleGenAI } from "@google/genai";
 import { NailDesignState } from "./types";
 
-// Using Flash-Image for better reliability and speed
-const MODEL_NAME = "gemini-2.5-flash-image";
-
 export const generateNailArt = async (
-  originalImageBase64: string,
+  _originalImageBase64: string,
   design: NailDesignState
 ): Promise<string> => {
-  
-  // 1. Try Vercel Env Var
-  let apiKey = process.env.API_KEY;
-
-  // 2. Try WordPress/Window Injection
+  let apiKey = import.meta.env.VITE_MINIMAX_API_KEY || import.meta.env.VITE_API_KEY;
   if (!apiKey && window.nailArtSettings?.apiKey) {
     apiKey = window.nailArtSettings.apiKey;
   }
 
-  // 3. Try AI Studio Selection (if available in preview)
-  // We don't need to manually get the key string for AI Studio, 
-  // checking hasSelectedApiKey verifies we can proceed.
-  const isAIStudio = window.aistudio && await window.aistudio.hasSelectedApiKey();
-
-  if (!apiKey && !isAIStudio) {
-    throw new Error("API Key is missing. Please set VITE_API_KEY in Vercel Settings or inject via window.nailArtSettings.");
+  if (!apiKey) {
+    throw new Error("API Key is missing. Please set VITE_MINIMAX_API_KEY in your .env file.");
   }
 
-  // Initialize AI Client
-  // If we are in AI Studio, the key is injected automatically by the SDK context,
-  // so we can pass a dummy key or rely on the environment if process.env.API_KEY is populated by the studio.
-  // However, the safest bet for the SDK is to assume process.env.API_KEY is set if we are in a valid env.
-  // If we are falling back to a manually provided key (Env or Window), we use it.
-  
-  const ai = new GoogleGenAI({ apiKey: apiKey || process.env.API_KEY || 'DUMMY_KEY_FOR_STUDIO' });
+  const color = design.useCustomColor ? design.customColor : getColorForFamily(design.baseColorFamily);
 
-  // Clean base64 string (remove data:image/png;base64, prefix if present)
-  const cleanBase64 = originalImageBase64.replace(/^data:image\/(png|jpeg|jpg|webp);base64,/, "");
+  let prompt = `You are a professional nail artist. Generate a stunning, photorealistic close-up image of beautiful nail art.
 
-  // Construct a precise prompt for the model
-  let prompt = `
-    Act as a professional beauty editor. Edit the attached photo of a hand.
-    Goal: Apply a photorealistic nail art design to the fingernails.
-    
-    Strict Constraints:
-    1. PRESERVE the original hand's skin tone, lighting, shadows, and finger positions exactly. Do not regenerate the hand or background.
-    2. Only modify the fingernails.
-    3. Ensure the nail edges are sharp and realistic (perfect segmentation).
-    4. Apply realistic lighting reflections to the nails matching the scene.
-    
-    Design Specifications:
-    - Nail Shape: ${design.shape}
-    - Nail Length: ${design.length}
-    - Finish/Texture: ${design.finish}
-  `;
+Design specifications:
+- Number of nails: ${design.nailCount}
+- Base color: ${design.useCustomColor ? design.customColor : design.baseColorFamily}
+- Nail shape: ${design.shape}
+- Nail length: ${design.length}
+- Finish / texture: ${design.finish}
+- Art style: ${design.artStyle}`;
 
   if (design.patternPrompt) {
-    prompt += `\n- Design/Pattern: ${design.patternPrompt}`;
-    prompt += `\n- Base Color: Use ${design.color} as a base if the design allows, or integrate it.`;
-  } else {
-    prompt += `\n- Color: Solid color ${design.color}.`;
+    prompt += `\n- Custom pattern: ${design.patternPrompt}`;
   }
 
-  prompt += `\n\nOutput the result as a high-quality image.`;
+  prompt += `\n\nIMPORTANT COMPOSITION:
+- Show a clear, FULL-FRAME close-up of all ${design.nailCount} nails arranged in a horizontal row
+- All nails must be IN FOCUS and fully visible — no cropped, blurred, or cut-off nails
+- The image should be ZOOMED IN to show ONLY the nails, filling the entire frame
+- No hand, wrist, or background visible — ONLY the nails themselves
+- Even spacing between all nails, all the same size and shape
+- Clean, neutral, solid background (light gray or soft white)
+- Professional nail salon photography style — crisp, sharp, high resolution
+- Realistic lighting with natural shine/reflections matching the finish type`;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: "image/png",
-              data: cleanBase64
-            }
-          },
-          {
-            text: prompt
-          }
-        ]
-      }
-    });
+  const body = {
+    model: "image-01",
+    prompt: prompt,
+    aspect_ratio: "1:1",
+    response_format: "base64",
+  };
 
-    const parts = response.candidates?.[0]?.content?.parts;
-    if (!parts) {
-      throw new Error("No content generated");
+  let lastError = "";
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let data: any;
+    try {
+      const response = await fetch("https://api.minimax.io/v1/image_generation", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      data = await response.json();
+    } catch (err: any) {
+      lastError = err?.message || "Network error";
+      continue;
     }
 
-    for (const part of parts) {
-      if (part.inlineData && part.inlineData.data) {
-        return `data:image/png;base64,${part.inlineData.data}`;
+    const baseResp = data?.base_resp;
+    const statusCode = baseResp?.status_code;
+
+    if (statusCode === 0) {
+      const images = data?.data?.image_base64;
+      if (images && images.length > 0 && images[0].length > 1000) {
+        return `data:image/png;base64,${images[0]}`;
       }
+      lastError = "No image returned from MiniMax API. Please try again.";
+      continue;
     }
 
-    throw new Error("No image data found in response");
-  } catch (error) {
-    console.error("Gemini API Error:", error);
-    throw error;
+    if ([1033, 1004, 1005, 1006].includes(statusCode)) {
+      lastError = baseResp?.status_msg || "MiniMax is busy. Retrying...";
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, attempt * 2000));
+        continue;
+      }
+    } else {
+      lastError = baseResp?.status_msg || `MiniMax error (${statusCode})`;
+      break;
+    }
   }
+
+  throw new Error(lastError || "Failed to generate nail art. Please try again.");
 };
+
+function getColorForFamily(family: string): string {
+  const map: Record<string, string> = {
+    [BaseColorFamily.Nude]: "#e8c4a0",
+    [BaseColorFamily.Pink]: "#ffb7b2",
+    [BaseColorFamily.Red]: "#d50000",
+    [BaseColorFamily.Purple]: "#9c27b0",
+    [BaseColorFamily.Blue]: "#1565c0",
+    [BaseColorFamily.Green]: "#2e7d32",
+    [BaseColorFamily.Yellow]: "#f9a825",
+    [BaseColorFamily.Orange]: "#ff7043",
+    [BaseColorFamily.Brown]: "#795548",
+    [BaseColorFamily.Black]: "#1a1a1a",
+    [BaseColorFamily.White]: "#fafafa",
+    [BaseColorFamily.Rainbow]: "rainbow multicolor",
+  };
+  return map[family] || "#ffb7b2";
+}
+
+export enum BaseColorFamily {
+  Nude = 'Nude / Natural',
+  Pink = 'Pink / Rose',
+  Red = 'Red / Crimson',
+  Purple = 'Purple / Lavender',
+  Blue = 'Blue / Navy',
+  Green = 'Green / Mint',
+  Yellow = 'Yellow / Gold',
+  Orange = 'Orange / Peach',
+  Brown = 'Brown / Chocolate',
+  Black = 'Black / Dark',
+  White = 'White / Cream',
+  Rainbow = 'Rainbow / Multicolor',
+}
